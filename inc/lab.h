@@ -27,14 +27,11 @@ struct lab_job {
 };
 
 struct lab_ring {
-	pthread_mutex_t mu;
-	pthread_cond_t nonempty;
-	pthread_cond_t nonfull;
 	struct lab_job *buf;
 	uint32_t cap;
-	uint32_t head;
-	uint32_t tail;
-	uint32_t count;
+	uint32_t mask;
+	__attribute__((aligned(64))) volatile uint32_t head;
+	__attribute__((aligned(64))) volatile uint32_t tail;
 };
 
 struct lab_pool {
@@ -53,23 +50,6 @@ struct lab_zc_port {
 	int ifindex;
 };
 
-struct lab_stats {
-	uint64_t rx_loc;
-	uint64_t rx_wan;
-	uint64_t mid_to_wan;
-	uint64_t mid_to_loc;
-	uint64_t tx_loc_ok;
-	uint64_t tx_loc_fail;
-	uint64_t tx_wan_ok;
-	uint64_t tx_wan_fail;
-	uint64_t cq_loc;
-	uint64_t cq_wan;
-	uint64_t fq_refill_loc;
-	uint64_t fq_refill_wan;
-	int last_tx_loc_errno;
-	int last_tx_wan_errno;
-};
-
 struct lab_pair {
 	void *bufs;
 	size_t bufsize;
@@ -83,15 +63,15 @@ struct lab_pair {
 	struct bpf_object *bpf_wan;
 	uint8_t xdp_loc_on;
 	uint8_t xdp_wan_on;
-	struct lab_stats *stats;
 };
 
 int lab_ring_init(struct lab_ring *r, uint32_t cap);
 void lab_ring_destroy(struct lab_ring *r);
 int lab_ring_try_pop(struct lab_ring *r, struct lab_job *j);
-void lab_ring_wake_all(struct lab_ring *r);
+int lab_ring_try_push(struct lab_ring *r, const struct lab_job *j);
 int lab_ring_push_retry(struct lab_ring *r, const struct lab_job *j,
 			volatile sig_atomic_t *stop);
+void lab_ring_wake_all(struct lab_ring *r);
 
 int lab_pool_init(struct lab_pool *p, uint32_t cap);
 void lab_pool_destroy(struct lab_pool *p);
@@ -104,8 +84,8 @@ void lab_pair_close(struct lab_pair *p);
 
 int lab_recv_loc(struct lab_pair *p, uint32_t *lens, uint64_t *addrs, int max);
 int lab_recv_wan(struct lab_pair *p, uint32_t *lens, uint64_t *addrs, int max);
-int lab_tx_loc(struct lab_pair *p, uint64_t addr, uint32_t len);
-int lab_tx_wan(struct lab_pair *p, uint64_t addr, uint32_t len);
+int lab_tx_loc_batch(struct lab_pair *p, const struct lab_job *jobs, int n);
+int lab_tx_wan_batch(struct lab_pair *p, const struct lab_job *jobs, int n);
 void lab_drain_cq_loc(struct lab_pair *p);
 void lab_drain_cq_wan(struct lab_pair *p);
 void lab_refill_fq_loc(struct lab_pair *p);
@@ -120,11 +100,9 @@ struct lab_ctx {
 	struct lab_ring wan_to_mid;
 	struct lab_ring w_to_wan;
 	struct lab_ring w_to_loc;
-	struct lab_stats stats;
 	pthread_t th_loc;
 	pthread_t th_mid;
 	pthread_t th_wan;
-	pthread_t th_stats;
 };
 
 int lab_run(struct lab_ctx *ctx, const char *loc_if, const char *wan_if,

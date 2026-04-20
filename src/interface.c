@@ -2,7 +2,6 @@
 #include <net/if.h>
 #include <linux/if_link.h>
 #include <linux/if_xdp.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -15,6 +14,15 @@
 #include <xdp/xsk.h>
 
 #include "lab.h"
+
+static inline void cpu_relax(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+	__builtin_ia32_pause();
+#else
+	__asm__ volatile("" ::: "memory");
+#endif
+}
 
 static int lab_xskmap_bind(struct xsk_socket *xsk, int map_fd)
 {
@@ -34,81 +42,64 @@ static int lab_xskmap_bind(struct xsk_socket *xsk, int map_fd)
 int lab_ring_init(struct lab_ring *r, uint32_t cap)
 {
 	memset(r, 0, sizeof(*r));
-	r->cap = cap;
+	if (cap == 0 || (cap & (cap - 1)))
+		return -1;
 	r->buf = calloc(cap, sizeof(struct lab_job));
 	if (!r->buf)
 		return -1;
-	if (pthread_mutex_init(&r->mu, NULL))
-		goto err_buf;
-	if (pthread_cond_init(&r->nonempty, NULL))
-		goto err_mu;
-	if (pthread_cond_init(&r->nonfull, NULL))
-		goto err_nonempty;
+	r->cap = cap;
+	r->mask = cap - 1;
+	r->head = 0;
+	r->tail = 0;
 	return 0;
-
-err_nonempty:
-	pthread_mutex_destroy(&r->mu);
-err_mu:
-	free(r->buf);
-	r->buf = NULL;
-err_buf:
-	return -1;
 }
 
 void lab_ring_destroy(struct lab_ring *r)
 {
 	if (!r->buf)
 		return;
-	pthread_cond_destroy(&r->nonfull);
-	pthread_cond_destroy(&r->nonempty);
-	pthread_mutex_destroy(&r->mu);
 	free(r->buf);
 	r->buf = NULL;
 }
 
 void lab_ring_wake_all(struct lab_ring *r)
 {
-	pthread_mutex_lock(&r->mu);
-	pthread_cond_broadcast(&r->nonempty);
-	pthread_cond_broadcast(&r->nonfull);
-	pthread_mutex_unlock(&r->mu);
+	(void)r;
+}
+
+int lab_ring_try_push(struct lab_ring *r, const struct lab_job *j)
+{
+	uint32_t head = __atomic_load_n(&r->head, __ATOMIC_RELAXED);
+	uint32_t tail = __atomic_load_n(&r->tail, __ATOMIC_ACQUIRE);
+
+	if ((uint32_t)(head - tail) >= r->cap)
+		return -1;
+	r->buf[head & r->mask] = *j;
+	__atomic_store_n(&r->head, head + 1, __ATOMIC_RELEASE);
+	return 0;
 }
 
 int lab_ring_try_pop(struct lab_ring *r, struct lab_job *j)
 {
-	int rv = -1;
+	uint32_t tail = __atomic_load_n(&r->tail, __ATOMIC_RELAXED);
+	uint32_t head = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
 
-	pthread_mutex_lock(&r->mu);
-	if (r->count > 0) {
-		*j = r->buf[r->head];
-		r->head = (r->head + 1) % r->cap;
-		r->count--;
-		pthread_cond_signal(&r->nonfull);
-		rv = 0;
-	}
-	pthread_mutex_unlock(&r->mu);
-	return rv;
+	if (tail == head)
+		return -1;
+	*j = r->buf[tail & r->mask];
+	__atomic_store_n(&r->tail, tail + 1, __ATOMIC_RELEASE);
+	return 0;
 }
 
 int lab_ring_push_retry(struct lab_ring *r, const struct lab_job *j,
 			volatile sig_atomic_t *stop)
 {
-	pthread_mutex_lock(&r->mu);
-	for (;;) {
-		if (*stop) {
-			pthread_mutex_unlock(&r->mu);
-			return -1;
-		}
-		if (r->count < r->cap)
-			break;
-		pthread_cond_wait(&r->nonfull, &r->mu);
+	while (!*stop) {
+		if (lab_ring_try_push(r, j) == 0)
+			return 0;
+		cpu_relax();
 	}
-	r->buf[r->tail] = *j;
-	r->tail = (r->tail + 1) % r->cap;
-	r->count++;
-	pthread_cond_signal(&r->nonempty);
-	pthread_mutex_unlock(&r->mu);
-	return 0;
+	return -1;
 }
 
 int lab_pool_init(struct lab_pool *p, uint32_t cap)
@@ -295,7 +286,8 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 		goto err_bpf;
 
 	pl = bpf_object__find_program_by_name(p->bpf_loc, "xdp_redirect_prog");
-	pw = bpf_object__find_program_by_name(p->bpf_wan, "xdp_wan_redirect_prog");
+	pw = bpf_object__find_program_by_name(p->bpf_wan,
+					      "xdp_wan_redirect_prog");
 	if (!pl || !pw)
 		goto err_bpf;
 
@@ -317,12 +309,6 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 	    lab_xskmap_bind(p->wan.xsk, bpf_map__fd(mw)))
 		goto err_xdp;
 
-	fprintf(stderr,
-		"[necz] init ok ZC+DRV loc=%s(ifindex=%d,xsk_fd=%d) wan=%s(ifindex=%d,xsk_fd=%d) frames=%u pool_left=%u\n",
-		loc_if, p->loc.ifindex, xsk_socket__fd(p->loc.xsk),
-		wan_if, p->wan.ifindex, xsk_socket__fd(p->wan.xsk),
-		p->n_frames, p->pool.n);
-	fflush(stderr);
 	return 0;
 
 err_xdp:
@@ -395,8 +381,8 @@ void lab_pair_close(struct lab_pair *p)
 	}
 }
 
-static int lab_recv_port(struct lab_zc_port *port, uint64_t *counter,
-			 uint32_t *lens, uint64_t *addrs, int max)
+static int lab_recv_port(struct lab_zc_port *port, uint32_t *lens,
+			 uint64_t *addrs, int max)
 {
 	uint32_t idx;
 	unsigned int n;
@@ -417,68 +403,54 @@ static int lab_recv_port(struct lab_zc_port *port, uint64_t *counter,
 		lens[i] = d->len;
 	}
 	xsk_ring_cons__release(&port->rx, n);
-	if (counter)
-		*counter += n;
 	return (int)n;
 }
 
 int lab_recv_loc(struct lab_pair *p, uint32_t *lens, uint64_t *addrs, int max)
 {
-	return lab_recv_port(&p->loc, p->stats ? &p->stats->rx_loc : NULL,
-			     lens, addrs, max);
+	return lab_recv_port(&p->loc, lens, addrs, max);
 }
 
 int lab_recv_wan(struct lab_pair *p, uint32_t *lens, uint64_t *addrs, int max)
 {
-	return lab_recv_port(&p->wan, p->stats ? &p->stats->rx_wan : NULL,
-			     lens, addrs, max);
+	return lab_recv_port(&p->wan, lens, addrs, max);
 }
 
-static int lab_tx_one(struct lab_zc_port *port, uint64_t *ok, uint64_t *fail,
-		      int *last_errno, uint64_t addr, uint32_t len)
+static int lab_tx_batch(struct lab_zc_port *port, const struct lab_job *jobs,
+			int n)
 {
 	uint32_t idx;
+	uint32_t reserved;
+	int i;
 
-	if (xsk_ring_prod__reserve(&port->tx, 1, &idx) != 1) {
-		if (fail)
-			(*fail)++;
-		return -1;
+	if (n <= 0)
+		return 0;
+	reserved = xsk_ring_prod__reserve(&port->tx, (uint32_t)n, &idx);
+	if (!reserved)
+		return 0;
+	for (i = 0; i < (int)reserved; i++) {
+		struct xdp_desc *d =
+			xsk_ring_prod__tx_desc(&port->tx, idx + i);
+
+		d->addr = jobs[i].umem_addr;
+		d->len = jobs[i].len;
 	}
-	xsk_ring_prod__tx_desc(&port->tx, idx)->addr = addr;
-	xsk_ring_prod__tx_desc(&port->tx, idx)->len = len;
-	xsk_ring_prod__submit(&port->tx, 1);
-	if (xsk_ring_prod__needs_wakeup(&port->tx)) {
-		errno = 0;
-		(void)sendto(xsk_socket__fd(port->xsk), NULL, 0,
-			     MSG_DONTWAIT, NULL, 0);
-		if (last_errno)
-			*last_errno = errno;
-	}
-	if (ok)
-		(*ok)++;
-	return 0;
+	xsk_ring_prod__submit(&port->tx, reserved);
+	(void)sendto(xsk_socket__fd(port->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+	return (int)reserved;
 }
 
-int lab_tx_loc(struct lab_pair *p, uint64_t addr, uint32_t len)
+int lab_tx_loc_batch(struct lab_pair *p, const struct lab_job *jobs, int n)
 {
-	struct lab_stats *s = p->stats;
-
-	return lab_tx_one(&p->loc, s ? &s->tx_loc_ok : NULL,
-			  s ? &s->tx_loc_fail : NULL,
-			  s ? &s->last_tx_loc_errno : NULL, addr, len);
+	return lab_tx_batch(&p->loc, jobs, n);
 }
 
-int lab_tx_wan(struct lab_pair *p, uint64_t addr, uint32_t len)
+int lab_tx_wan_batch(struct lab_pair *p, const struct lab_job *jobs, int n)
 {
-	struct lab_stats *s = p->stats;
-
-	return lab_tx_one(&p->wan, s ? &s->tx_wan_ok : NULL,
-			  s ? &s->tx_wan_fail : NULL,
-			  s ? &s->last_tx_wan_errno : NULL, addr, len);
+	return lab_tx_batch(&p->wan, jobs, n);
 }
 
-static void lab_drain_cq_port(struct lab_pair *p, struct lab_zc_port *port,
-			      uint64_t *cq_counter)
+static void lab_drain_cq_port(struct lab_pair *p, struct lab_zc_port *port)
 {
 	uint64_t addrs[LAB_BATCH];
 	uint32_t idx;
@@ -492,22 +464,19 @@ static void lab_drain_cq_port(struct lab_pair *p, struct lab_zc_port *port,
 		addrs[i] = *xsk_ring_cons__comp_addr(&port->cq, idx + i);
 	xsk_ring_cons__release(&port->cq, n);
 	(void)lab_pool_push(&p->pool, addrs, n);
-	if (cq_counter)
-		*cq_counter += n;
 }
 
 void lab_drain_cq_loc(struct lab_pair *p)
 {
-	lab_drain_cq_port(p, &p->loc, p->stats ? &p->stats->cq_loc : NULL);
+	lab_drain_cq_port(p, &p->loc);
 }
 
 void lab_drain_cq_wan(struct lab_pair *p)
 {
-	lab_drain_cq_port(p, &p->wan, p->stats ? &p->stats->cq_wan : NULL);
+	lab_drain_cq_port(p, &p->wan);
 }
 
-static void lab_refill_fq_port(struct lab_pair *p, struct lab_zc_port *port,
-			       uint64_t *refill_counter)
+static void lab_refill_fq_port(struct lab_pair *p, struct lab_zc_port *port)
 {
 	uint64_t addrs[LAB_BATCH];
 	uint32_t got;
@@ -528,18 +497,14 @@ static void lab_refill_fq_port(struct lab_pair *p, struct lab_zc_port *port,
 	for (i = 0; i < got; i++)
 		*xsk_ring_prod__fill_addr(&port->fq, idx + i) = addrs[i];
 	xsk_ring_prod__submit(&port->fq, got);
-	if (refill_counter)
-		*refill_counter += got;
 }
 
 void lab_refill_fq_loc(struct lab_pair *p)
 {
-	lab_refill_fq_port(p, &p->loc,
-			   p->stats ? &p->stats->fq_refill_loc : NULL);
+	lab_refill_fq_port(p, &p->loc);
 }
 
 void lab_refill_fq_wan(struct lab_pair *p)
 {
-	lab_refill_fq_port(p, &p->wan,
-			   p->stats ? &p->stats->fq_refill_wan : NULL);
+	lab_refill_fq_port(p, &p->wan);
 }
