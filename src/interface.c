@@ -166,15 +166,12 @@ void *lab_ptr(struct lab_pair *p, uint64_t addr)
 static int lab_sock_open(struct lab_pair *p, struct lab_zc_port *port,
 			 const char *ifn)
 {
-	const char *copy_env = getenv("NECZ_COPY");
-	int use_copy = copy_env && copy_env[0] && copy_env[0] != '0';
 	struct xsk_socket_config cfg = {
 		.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS,
 		.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS,
 		.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
-		.xdp_flags = use_copy ? XDP_FLAGS_SKB_MODE : XDP_FLAGS_DRV_MODE,
-		.bind_flags = XDP_USE_NEED_WAKEUP |
-			      (use_copy ? XDP_COPY : XDP_ZEROCOPY),
+		.xdp_flags = XDP_FLAGS_DRV_MODE,
+		.bind_flags = XDP_USE_NEED_WAKEUP | XDP_ZEROCOPY,
 	};
 
 	return xsk_socket__create_shared(&port->xsk, ifn, 0, p->umem,
@@ -287,23 +284,15 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 	if (!pl || !pw)
 		goto err_bpf;
 
-	{
-		const char *copy_env = getenv("NECZ_COPY");
-		int use_copy =
-			copy_env && copy_env[0] && copy_env[0] != '0';
-		unsigned int att_flags = use_copy ? XDP_FLAGS_SKB_MODE :
-						    XDP_FLAGS_DRV_MODE;
+	if (bpf_xdp_attach(p->loc.ifindex, bpf_program__fd(pl),
+			   XDP_FLAGS_DRV_MODE, NULL))
+		goto err_bpf;
+	p->xdp_loc_on = 1;
 
-		if (bpf_xdp_attach(p->loc.ifindex, bpf_program__fd(pl),
-				   att_flags, NULL))
-			goto err_bpf;
-		p->xdp_loc_on = 1;
-
-		if (bpf_xdp_attach(p->wan.ifindex, bpf_program__fd(pw),
-				   att_flags, NULL))
-			goto err_bpf;
-		p->xdp_wan_on = 1;
-	}
+	if (bpf_xdp_attach(p->wan.ifindex, bpf_program__fd(pw),
+			   XDP_FLAGS_DRV_MODE, NULL))
+		goto err_bpf;
+	p->xdp_wan_on = 1;
 
 	ml = bpf_object__find_map_by_name(p->bpf_loc, "xsks_map");
 	mw = bpf_object__find_map_by_name(p->bpf_wan, "wan_xsks_map");
@@ -316,21 +305,13 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 	return 0;
 
 err_xdp:
-	{
-		const char *copy_env = getenv("NECZ_COPY");
-		int use_copy =
-			copy_env && copy_env[0] && copy_env[0] != '0';
-		unsigned int det_flags = use_copy ? XDP_FLAGS_SKB_MODE :
-						    XDP_FLAGS_DRV_MODE;
-
-		if (p->xdp_wan_on) {
-			bpf_xdp_detach(p->wan.ifindex, det_flags, NULL);
-			p->xdp_wan_on = 0;
-		}
-		if (p->xdp_loc_on) {
-			bpf_xdp_detach(p->loc.ifindex, det_flags, NULL);
-			p->xdp_loc_on = 0;
-		}
+	if (p->xdp_wan_on) {
+		bpf_xdp_detach(p->wan.ifindex, XDP_FLAGS_DRV_MODE, NULL);
+		p->xdp_wan_on = 0;
+	}
+	if (p->xdp_loc_on) {
+		bpf_xdp_detach(p->loc.ifindex, XDP_FLAGS_DRV_MODE, NULL);
+		p->xdp_loc_on = 0;
 	}
 err_bpf:
 	if (p->bpf_wan)
@@ -358,17 +339,12 @@ err_mmap:
 
 void lab_pair_close(struct lab_pair *p)
 {
-	const char *copy_env = getenv("NECZ_COPY");
-	int use_copy = copy_env && copy_env[0] && copy_env[0] != '0';
-	unsigned int det_flags = use_copy ? XDP_FLAGS_SKB_MODE :
-					    XDP_FLAGS_DRV_MODE;
-
 	if (p->xdp_wan_on) {
-		bpf_xdp_detach(p->wan.ifindex, det_flags, NULL);
+		bpf_xdp_detach(p->wan.ifindex, XDP_FLAGS_DRV_MODE, NULL);
 		p->xdp_wan_on = 0;
 	}
 	if (p->xdp_loc_on) {
-		bpf_xdp_detach(p->loc.ifindex, det_flags, NULL);
+		bpf_xdp_detach(p->loc.ifindex, XDP_FLAGS_DRV_MODE, NULL);
 		p->xdp_loc_on = 0;
 	}
 	if (p->bpf_wan) {
