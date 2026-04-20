@@ -103,6 +103,14 @@ int lab_ring_push_retry(struct lab_ring *r, const struct lab_job *j,
 	return -1;
 }
 
+uint32_t lab_ring_count(const struct lab_ring *r)
+{
+	uint32_t head = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
+	uint32_t tail = __atomic_load_n(&r->tail, __ATOMIC_ACQUIRE);
+
+	return head - tail;
+}
+
 int lab_pool_init(struct lab_pool *p, uint32_t cap)
 {
 	memset(p, 0, sizeof(*p));
@@ -232,52 +240,36 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 		goto err_wan_xsk;
 
 	{
-		uint32_t want = ucfg.fill_size;
-		uint32_t got;
-		uint32_t idx;
-		uint32_t k;
+		uint32_t per_fq = LAB_FQ_INIT;
+		struct lab_zc_port *ports[2] = { &p->loc, &p->wan };
+		int pi;
 
-		got = lab_pool_pop(&p->pool, addrs,
-				   want > LAB_BATCH ? LAB_BATCH : want);
-		while (got > 0) {
-			if (xsk_ring_prod__reserve(&p->loc.fq, got, &idx) !=
-			    got)
-				goto err_wan_xsk;
-			for (k = 0; k < got; k++)
-				*xsk_ring_prod__fill_addr(&p->loc.fq,
-							  idx + k) = addrs[k];
-			xsk_ring_prod__submit(&p->loc.fq, got);
-			want -= got;
-			if (!want)
-				break;
-			got = lab_pool_pop(&p->pool, addrs,
-					   want > LAB_BATCH ? LAB_BATCH :
-							      want);
-		}
-	}
+		if (per_fq > ucfg.fill_size)
+			per_fq = ucfg.fill_size;
 
-	{
-		uint32_t want = ucfg.fill_size;
-		uint32_t got;
-		uint32_t idx;
-		uint32_t k;
+		for (pi = 0; pi < 2; pi++) {
+			uint32_t want = per_fq;
+			uint32_t got;
+			uint32_t idx;
+			uint32_t k;
 
-		got = lab_pool_pop(&p->pool, addrs,
-				   want > LAB_BATCH ? LAB_BATCH : want);
-		while (got > 0) {
-			if (xsk_ring_prod__reserve(&p->wan.fq, got, &idx) !=
-			    got)
-				goto err_wan_xsk;
-			for (k = 0; k < got; k++)
-				*xsk_ring_prod__fill_addr(&p->wan.fq,
-							  idx + k) = addrs[k];
-			xsk_ring_prod__submit(&p->wan.fq, got);
-			want -= got;
-			if (!want)
-				break;
-			got = lab_pool_pop(&p->pool, addrs,
-					   want > LAB_BATCH ? LAB_BATCH :
-							      want);
+			while (want > 0) {
+				uint32_t take = want > LAB_BATCH ? LAB_BATCH :
+								   want;
+
+				got = lab_pool_pop(&p->pool, addrs, take);
+				if (!got)
+					break;
+				if (xsk_ring_prod__reserve(&ports[pi]->fq, got,
+							   &idx) != got)
+					goto err_wan_xsk;
+				for (k = 0; k < got; k++)
+					*xsk_ring_prod__fill_addr(
+						&ports[pi]->fq,
+						idx + k) = addrs[k];
+				xsk_ring_prod__submit(&ports[pi]->fq, got);
+				want -= got;
+			}
 		}
 	}
 
@@ -446,38 +438,65 @@ int lab_recv_wan(struct lab_pair *p, uint32_t *lens, uint64_t *addrs, int max)
 	return lab_recv_port(&p->wan, lens, addrs, max);
 }
 
-static int lab_tx_batch(struct lab_zc_port *port, const struct lab_job *jobs,
-			int n)
+static int lab_tx_drain_port(struct lab_pair *p, struct lab_zc_port *port,
+			     struct lab_ring *src)
 {
+	struct lab_job batch[LAB_BATCH];
+	uint32_t ring_cnt, tx_free, want;
 	uint32_t idx;
-	uint32_t reserved;
-	int i;
+	uint32_t i;
+	int n = 0;
+	int xfd = xsk_socket__fd(port->xsk);
 
-	if (n <= 0)
+	ring_cnt = lab_ring_count(src);
+	if (!ring_cnt) {
+		if (xsk_ring_prod__needs_wakeup(&port->tx))
+			(void)sendto(xfd, NULL, 0, MSG_DONTWAIT, NULL, 0);
 		return 0;
-	reserved = xsk_ring_prod__reserve(&port->tx, (uint32_t)n, &idx);
-	if (!reserved)
+	}
+	tx_free = xsk_prod_nb_free(&port->tx, LAB_BATCH);
+	if (!tx_free) {
+		(void)sendto(xfd, NULL, 0, MSG_DONTWAIT, NULL, 0);
 		return 0;
-	for (i = 0; i < (int)reserved; i++) {
+	}
+	want = ring_cnt < LAB_BATCH ? ring_cnt : LAB_BATCH;
+	if (tx_free < want)
+		want = tx_free;
+
+	while (n < (int)want && lab_ring_try_pop(src, &batch[n]) == 0)
+		n++;
+	if (!n)
+		return 0;
+	if (xsk_ring_prod__reserve(&port->tx, (uint32_t)n, &idx) !=
+	    (uint32_t)n) {
+		uint64_t addrs[LAB_BATCH];
+		int j;
+
+		for (j = 0; j < n; j++)
+			addrs[j] = batch[j].umem_addr;
+		(void)lab_pool_push(&p->pool, addrs, (uint32_t)n);
+		return 0;
+	}
+	for (i = 0; i < (uint32_t)n; i++) {
 		struct xdp_desc *d =
 			xsk_ring_prod__tx_desc(&port->tx, idx + i);
 
-		d->addr = jobs[i].umem_addr;
-		d->len = jobs[i].len;
+		d->addr = batch[i].umem_addr;
+		d->len = batch[i].len;
 	}
-	xsk_ring_prod__submit(&port->tx, reserved);
-	(void)sendto(xsk_socket__fd(port->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
-	return (int)reserved;
+	xsk_ring_prod__submit(&port->tx, (uint32_t)n);
+	(void)sendto(xfd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+	return n;
 }
 
-int lab_tx_loc_batch(struct lab_pair *p, const struct lab_job *jobs, int n)
+int lab_tx_drain_loc(struct lab_pair *p, struct lab_ring *src)
 {
-	return lab_tx_batch(&p->loc, jobs, n);
+	return lab_tx_drain_port(p, &p->loc, src);
 }
 
-int lab_tx_wan_batch(struct lab_pair *p, const struct lab_job *jobs, int n)
+int lab_tx_drain_wan(struct lab_pair *p, struct lab_ring *src)
 {
-	return lab_tx_batch(&p->wan, jobs, n);
+	return lab_tx_drain_port(p, &p->wan, src);
 }
 
 static void lab_drain_cq_port(struct lab_pair *p, struct lab_zc_port *port)

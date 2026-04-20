@@ -44,35 +44,6 @@ static void rewrite_eth(struct lab_pair *zc, uint64_t addr, enum lab_dir d)
 	}
 }
 
-static int drain_tx_batch(struct lab_pair *zc, struct lab_ring *src,
-			  int (*tx_fn)(struct lab_pair *, const struct lab_job *,
-				       int),
-			  void (*cq_fn)(struct lab_pair *))
-{
-	struct lab_job batch[LAB_BATCH];
-	int n = 0;
-	int sent;
-	int retries = 16;
-
-	while (n < (int)LAB_BATCH && lab_ring_try_pop(src, &batch[n]) == 0)
-		n++;
-	if (!n)
-		return 0;
-	sent = tx_fn(zc, batch, n);
-	while (sent < n && retries--) {
-		int r;
-
-		cq_fn(zc);
-		r = tx_fn(zc, &batch[sent], n - sent);
-		if (r <= 0) {
-			cpu_relax();
-			continue;
-		}
-		sent += r;
-	}
-	return sent;
-}
-
 static void *loc_worker(void *arg)
 {
 	struct lab_ctx *ctx = arg;
@@ -86,8 +57,7 @@ static void *loc_worker(void *arg)
 		lab_drain_cq_loc(&ctx->zc);
 		lab_refill_fq_loc(&ctx->zc);
 
-		tx_sent = drain_tx_batch(&ctx->zc, &ctx->w_to_loc,
-					 lab_tx_loc_batch, lab_drain_cq_loc);
+		tx_sent = lab_tx_drain_loc(&ctx->zc, &ctx->w_to_loc);
 
 		n = lab_recv_loc(&ctx->zc, lens, addrs, LAB_BATCH);
 		for (i = 0; i < n; i++) {
@@ -116,8 +86,7 @@ static void *wan_worker(void *arg)
 		lab_drain_cq_wan(&ctx->zc);
 		lab_refill_fq_wan(&ctx->zc);
 
-		tx_sent = drain_tx_batch(&ctx->zc, &ctx->w_to_wan,
-					 lab_tx_wan_batch, lab_drain_cq_wan);
+		tx_sent = lab_tx_drain_wan(&ctx->zc, &ctx->w_to_wan);
 
 		n = lab_recv_wan(&ctx->zc, lens, addrs, LAB_BATCH);
 		for (i = 0; i < n; i++) {

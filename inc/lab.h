@@ -10,8 +10,9 @@ struct bpf_object;
 
 #define LAB_RING       4096u
 #define LAB_FRAME      4096u
-#define LAB_N_FRAMES   4096u
+#define LAB_N_FRAMES   8192u
 #define LAB_BATCH      64u
+#define LAB_FQ_INIT    2048u
 #define LAB_CPU_LOC    0u
 #define LAB_CPU_MID    3u
 #define LAB_CPU_WAN    11u
@@ -71,6 +72,7 @@ int lab_ring_try_pop(struct lab_ring *r, struct lab_job *j);
 int lab_ring_try_push(struct lab_ring *r, const struct lab_job *j);
 int lab_ring_push_retry(struct lab_ring *r, const struct lab_job *j,
 			volatile sig_atomic_t *stop);
+uint32_t lab_ring_count(const struct lab_ring *r);
 void lab_ring_wake_all(struct lab_ring *r);
 
 int lab_pool_init(struct lab_pool *p, uint32_t cap);
@@ -84,8 +86,8 @@ void lab_pair_close(struct lab_pair *p);
 
 int lab_recv_loc(struct lab_pair *p, uint32_t *lens, uint64_t *addrs, int max);
 int lab_recv_wan(struct lab_pair *p, uint32_t *lens, uint64_t *addrs, int max);
-int lab_tx_loc_batch(struct lab_pair *p, const struct lab_job *jobs, int n);
-int lab_tx_wan_batch(struct lab_pair *p, const struct lab_job *jobs, int n);
+int lab_tx_drain_loc(struct lab_pair *p, struct lab_ring *src);
+int lab_tx_drain_wan(struct lab_pair *p, struct lab_ring *src);
 void lab_drain_cq_loc(struct lab_pair *p);
 void lab_drain_cq_wan(struct lab_pair *p);
 void lab_refill_fq_loc(struct lab_pair *p);
