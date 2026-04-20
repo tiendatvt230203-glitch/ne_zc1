@@ -3,7 +3,7 @@ ARCH ?= $(shell uname -m | sed -e 's/aarch64/arm64/' -e 's/armv7l/arm/' -e 's/x8
 BPF_CLANG := clang
 BPF_CFLAGS := -O2 -g -target bpf -D__TARGET_ARCH_$(ARCH) -Wall -Werror -Wno-unused-value
 
-CFLAGS := -O2 -g -Wall -Wextra -I./inc -D_GNU_SOURCE
+CFLAGS := -O2 -g -Wall -Wextra -I./inc -D_GNU_SOURCE $(EXTRA_CFLAGS)
 LDFLAGS := -lxdp -lbpf -lelf -lz -lpthread
 
 OBJS := main.o src/interface.o src/threads.o

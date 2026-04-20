@@ -9,8 +9,8 @@
 struct bpf_object;
 
 #define LAB_RING       4096u
-#define LAB_FRAME      2048u
-#define LAB_N_FRAMES   8192u
+#define LAB_FRAME      4096u
+#define LAB_N_FRAMES   4096u
 #define LAB_BATCH      64u
 #define LAB_CPU_LOC    0u
 #define LAB_CPU_MID    3u
