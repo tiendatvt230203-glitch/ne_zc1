@@ -402,12 +402,8 @@ static int lab_recv_port(struct lab_zc_port *port, uint32_t *lens,
 	unsigned int i;
 
 	n = xsk_ring_cons__peek(&port->rx, (uint32_t)max, &idx);
-	if (!n) {
-		if (xsk_ring_prod__needs_wakeup(&port->fq))
-			(void)recvfrom(xsk_socket__fd(port->xsk), NULL, 0,
-				       MSG_DONTWAIT, NULL, 0);
+	if (!n)
 		return 0;
-	}
 	for (i = 0; i < n; i++) {
 		const struct xdp_desc *d =
 			xsk_ring_cons__rx_desc(&port->rx, idx + i);
@@ -445,11 +441,8 @@ static int lab_tx_drain_port(struct lab_zc_port *port, struct lab_ring *src,
 	int xfd = xsk_socket__fd(port->xsk);
 
 	ring_cnt = lab_ring_count(src);
-	if (!ring_cnt) {
-		if (xsk_ring_prod__needs_wakeup(&port->tx))
-			(void)sendto(xfd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+	if (!ring_cnt)
 		return 0;
-	}
 	tx_free = xsk_prod_nb_free(&port->tx, LAB_BATCH);
 	if (!tx_free) {
 		if (xsk_ring_prod__needs_wakeup(&port->tx))
@@ -482,8 +475,7 @@ static int lab_tx_drain_port(struct lab_zc_port *port, struct lab_ring *src,
 		d->len = batch[i].len;
 	}
 	xsk_ring_prod__submit(&port->tx, (uint32_t)n);
-	if (xsk_ring_prod__needs_wakeup(&port->tx))
-		(void)sendto(xfd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+	(void)sendto(xfd, NULL, 0, MSG_DONTWAIT, NULL, 0);
 	return n;
 }
 
@@ -547,6 +539,9 @@ static void lab_refill_fq_port(struct lab_zc_port *port,
 	for (i = 0; i < got; i++)
 		*xsk_ring_prod__fill_addr(&port->fq, idx + i) = addrs[i];
 	xsk_ring_prod__submit(&port->fq, got);
+	if (xsk_ring_prod__needs_wakeup(&port->fq))
+		(void)recvfrom(xsk_socket__fd(port->xsk), NULL, 0,
+			       MSG_DONTWAIT, NULL, 0);
 }
 
 void lab_refill_fq_loc(struct lab_pair *p)
