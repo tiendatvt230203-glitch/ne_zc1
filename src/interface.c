@@ -111,51 +111,59 @@ uint32_t lab_ring_count(const struct lab_ring *r)
 	return head - tail;
 }
 
-int lab_pool_init(struct lab_pool *p, uint32_t cap)
+int lab_addr_ring_init(struct lab_addr_ring *r, uint32_t cap)
 {
-	memset(p, 0, sizeof(*p));
-	p->stack = calloc(cap, sizeof(uint64_t));
-	if (!p->stack)
+	memset(r, 0, sizeof(*r));
+	if (cap == 0 || (cap & (cap - 1)))
 		return -1;
-	if (pthread_mutex_init(&p->mu, NULL)) {
-		free(p->stack);
-		p->stack = NULL;
+	r->buf = calloc(cap, sizeof(uint64_t));
+	if (!r->buf)
 		return -1;
-	}
-	p->cap = cap;
-	p->n = 0;
+	r->cap = cap;
+	r->mask = cap - 1;
+	r->head = 0;
+	r->tail = 0;
 	return 0;
 }
 
-void lab_pool_destroy(struct lab_pool *p)
+void lab_addr_ring_destroy(struct lab_addr_ring *r)
 {
-	if (!p->stack)
+	if (!r->buf)
 		return;
-	pthread_mutex_destroy(&p->mu);
-	free(p->stack);
-	p->stack = NULL;
+	free(r->buf);
+	r->buf = NULL;
 }
 
-uint32_t lab_pool_push(struct lab_pool *p, const uint64_t *addrs, uint32_t n)
+uint32_t lab_addr_ring_push(struct lab_addr_ring *r, const uint64_t *addrs,
+			    uint32_t n)
 {
-	uint32_t pushed = 0;
+	uint32_t head = __atomic_load_n(&r->head, __ATOMIC_RELAXED);
+	uint32_t tail = __atomic_load_n(&r->tail, __ATOMIC_ACQUIRE);
+	uint32_t free_slots = r->cap - (head - tail);
+	uint32_t i;
 
-	pthread_mutex_lock(&p->mu);
-	while (pushed < n && p->n < p->cap)
-		p->stack[p->n++] = addrs[pushed++];
-	pthread_mutex_unlock(&p->mu);
-	return pushed;
+	if (n > free_slots)
+		n = free_slots;
+	for (i = 0; i < n; i++)
+		r->buf[(head + i) & r->mask] = addrs[i];
+	__atomic_store_n(&r->head, head + n, __ATOMIC_RELEASE);
+	return n;
 }
 
-uint32_t lab_pool_pop(struct lab_pool *p, uint64_t *addrs, uint32_t n)
+uint32_t lab_addr_ring_pop(struct lab_addr_ring *r, uint64_t *addrs,
+			   uint32_t n)
 {
-	uint32_t popped = 0;
+	uint32_t tail = __atomic_load_n(&r->tail, __ATOMIC_RELAXED);
+	uint32_t head = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
+	uint32_t avail = head - tail;
+	uint32_t i;
 
-	pthread_mutex_lock(&p->mu);
-	while (popped < n && p->n > 0)
-		addrs[popped++] = p->stack[--p->n];
-	pthread_mutex_unlock(&p->mu);
-	return popped;
+	if (n > avail)
+		n = avail;
+	for (i = 0; i < n; i++)
+		addrs[i] = r->buf[(tail + i) & r->mask];
+	__atomic_store_n(&r->tail, tail + n, __ATOMIC_RELEASE);
+	return n;
 }
 
 void *lab_ptr(struct lab_pair *p, uint64_t addr)
@@ -210,13 +218,22 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 		return -1;
 	}
 
-	if (lab_pool_init(&p->pool, p->n_frames))
-		goto err_mmap;
+	if (lab_addr_ring_init(&p->pool_loc, p->n_frames) ||
+	    lab_addr_ring_init(&p->pool_wan, p->n_frames))
+		goto err_pool;
 
-	for (i = 0; i < p->n_frames; i++) {
-		uint64_t a = (uint64_t)i * p->frame_size;
+	{
+		uint32_t half = p->n_frames / 2;
+		uint64_t a;
 
-		(void)lab_pool_push(&p->pool, &a, 1);
+		for (i = 0; i < half; i++) {
+			a = (uint64_t)i * p->frame_size;
+			(void)lab_addr_ring_push(&p->pool_loc, &a, 1);
+		}
+		for (i = half; i < p->n_frames; i++) {
+			a = (uint64_t)i * p->frame_size;
+			(void)lab_addr_ring_push(&p->pool_wan, &a, 1);
+		}
 	}
 
 	err = xsk_umem__create(&p->umem, p->bufs, p->bufsize, &p->loc.fq,
@@ -239,6 +256,8 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 	{
 		uint32_t per_fq = LAB_FQ_INIT;
 		struct lab_zc_port *ports[2] = { &p->loc, &p->wan };
+		struct lab_addr_ring *pools[2] = { &p->pool_loc,
+						   &p->pool_wan };
 		int pi;
 
 		if (per_fq > ucfg.fill_size)
@@ -254,7 +273,7 @@ int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 				uint32_t take = want > LAB_BATCH ? LAB_BATCH :
 								   want;
 
-				got = lab_pool_pop(&p->pool, addrs, take);
+				got = lab_addr_ring_pop(pools[pi], addrs, take);
 				if (!got)
 					break;
 				if (xsk_ring_prod__reserve(&ports[pi]->fq, got,
@@ -330,8 +349,8 @@ err_umem:
 	xsk_umem__delete(p->umem);
 	p->umem = NULL;
 err_pool:
-	lab_pool_destroy(&p->pool);
-err_mmap:
+	lab_addr_ring_destroy(&p->pool_loc);
+	lab_addr_ring_destroy(&p->pool_wan);
 	munmap(p->bufs, p->bufsize);
 	p->bufs = NULL;
 	return -1;
@@ -367,7 +386,8 @@ void lab_pair_close(struct lab_pair *p)
 		xsk_umem__delete(p->umem);
 		p->umem = NULL;
 	}
-	lab_pool_destroy(&p->pool);
+	lab_addr_ring_destroy(&p->pool_loc);
+	lab_addr_ring_destroy(&p->pool_wan);
 	if (p->bufs) {
 		munmap(p->bufs, p->bufsize);
 		p->bufs = NULL;
@@ -414,8 +434,8 @@ int lab_recv_wan(struct lab_pair *p, uint32_t *lens, uint64_t *addrs, int max)
 	return lab_recv_port(&p->wan, lens, addrs, max);
 }
 
-static int lab_tx_drain_port(struct lab_pair *p, struct lab_zc_port *port,
-			     struct lab_ring *src)
+static int lab_tx_drain_port(struct lab_zc_port *port, struct lab_ring *src,
+			     struct lab_addr_ring *return_pool)
 {
 	struct lab_job batch[LAB_BATCH];
 	uint32_t ring_cnt, tx_free, want;
@@ -432,7 +452,8 @@ static int lab_tx_drain_port(struct lab_pair *p, struct lab_zc_port *port,
 	}
 	tx_free = xsk_prod_nb_free(&port->tx, LAB_BATCH);
 	if (!tx_free) {
-		(void)sendto(xfd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+		if (xsk_ring_prod__needs_wakeup(&port->tx))
+			(void)sendto(xfd, NULL, 0, MSG_DONTWAIT, NULL, 0);
 		return 0;
 	}
 	want = ring_cnt < LAB_BATCH ? ring_cnt : LAB_BATCH;
@@ -450,7 +471,7 @@ static int lab_tx_drain_port(struct lab_pair *p, struct lab_zc_port *port,
 
 		for (j = 0; j < n; j++)
 			addrs[j] = batch[j].umem_addr;
-		(void)lab_pool_push(&p->pool, addrs, (uint32_t)n);
+		(void)lab_addr_ring_push(return_pool, addrs, (uint32_t)n);
 		return 0;
 	}
 	for (i = 0; i < (uint32_t)n; i++) {
@@ -461,21 +482,23 @@ static int lab_tx_drain_port(struct lab_pair *p, struct lab_zc_port *port,
 		d->len = batch[i].len;
 	}
 	xsk_ring_prod__submit(&port->tx, (uint32_t)n);
-	(void)sendto(xfd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+	if (xsk_ring_prod__needs_wakeup(&port->tx))
+		(void)sendto(xfd, NULL, 0, MSG_DONTWAIT, NULL, 0);
 	return n;
 }
 
 int lab_tx_drain_loc(struct lab_pair *p, struct lab_ring *src)
 {
-	return lab_tx_drain_port(p, &p->loc, src);
+	return lab_tx_drain_port(&p->loc, src, &p->pool_wan);
 }
 
 int lab_tx_drain_wan(struct lab_pair *p, struct lab_ring *src)
 {
-	return lab_tx_drain_port(p, &p->wan, src);
+	return lab_tx_drain_port(&p->wan, src, &p->pool_loc);
 }
 
-static void lab_drain_cq_port(struct lab_pair *p, struct lab_zc_port *port)
+static void lab_drain_cq_port(struct lab_zc_port *port,
+			      struct lab_addr_ring *target_pool)
 {
 	uint64_t addrs[LAB_BATCH];
 	uint32_t idx;
@@ -488,20 +511,22 @@ static void lab_drain_cq_port(struct lab_pair *p, struct lab_zc_port *port)
 	for (i = 0; i < n; i++)
 		addrs[i] = *xsk_ring_cons__comp_addr(&port->cq, idx + i);
 	xsk_ring_cons__release(&port->cq, n);
-	(void)lab_pool_push(&p->pool, addrs, n);
+	(void)lab_addr_ring_push(target_pool, addrs, n);
 }
 
 void lab_drain_cq_loc(struct lab_pair *p)
 {
-	lab_drain_cq_port(p, &p->loc);
+	lab_drain_cq_port(&p->loc, &p->pool_wan);
 }
 
 void lab_drain_cq_wan(struct lab_pair *p)
 {
-	lab_drain_cq_port(p, &p->wan);
+	lab_drain_cq_port(&p->wan, &p->pool_loc);
 }
 
-static void lab_refill_fq_port(struct lab_pair *p, struct lab_zc_port *port)
+static void lab_refill_fq_port(struct lab_zc_port *port,
+			       struct lab_addr_ring *source_pool,
+			       struct lab_addr_ring *fallback_pool)
 {
 	uint64_t addrs[LAB_BATCH];
 	uint32_t got;
@@ -512,11 +537,11 @@ static void lab_refill_fq_port(struct lab_pair *p, struct lab_zc_port *port)
 	free_slots = xsk_prod_nb_free(&port->fq, LAB_BATCH);
 	if (free_slots < LAB_BATCH)
 		return;
-	got = lab_pool_pop(&p->pool, addrs, LAB_BATCH);
+	got = lab_addr_ring_pop(source_pool, addrs, LAB_BATCH);
 	if (!got)
 		return;
 	if (xsk_ring_prod__reserve(&port->fq, got, &idx) != got) {
-		(void)lab_pool_push(&p->pool, addrs, got);
+		(void)lab_addr_ring_push(fallback_pool, addrs, got);
 		return;
 	}
 	for (i = 0; i < got; i++)
@@ -526,10 +551,10 @@ static void lab_refill_fq_port(struct lab_pair *p, struct lab_zc_port *port)
 
 void lab_refill_fq_loc(struct lab_pair *p)
 {
-	lab_refill_fq_port(p, &p->loc);
+	lab_refill_fq_port(&p->loc, &p->pool_loc, &p->pool_wan);
 }
 
 void lab_refill_fq_wan(struct lab_pair *p)
 {
-	lab_refill_fq_port(p, &p->wan);
+	lab_refill_fq_port(&p->wan, &p->pool_wan, &p->pool_loc);
 }

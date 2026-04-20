@@ -35,11 +35,12 @@ struct lab_ring {
 	__attribute__((aligned(64))) volatile uint32_t tail;
 };
 
-struct lab_pool {
-	pthread_mutex_t mu;
-	uint64_t *stack;
+struct lab_addr_ring {
+	uint64_t *buf;
 	uint32_t cap;
-	uint32_t n;
+	uint32_t mask;
+	__attribute__((aligned(64))) volatile uint32_t head;
+	__attribute__((aligned(64))) volatile uint32_t tail;
 };
 
 struct lab_zc_port {
@@ -59,7 +60,8 @@ struct lab_pair {
 	struct xsk_umem *umem;
 	struct lab_zc_port loc;
 	struct lab_zc_port wan;
-	struct lab_pool pool;
+	struct lab_addr_ring pool_loc;
+	struct lab_addr_ring pool_wan;
 	struct bpf_object *bpf_loc;
 	struct bpf_object *bpf_wan;
 	uint8_t xdp_loc_on;
@@ -75,10 +77,12 @@ int lab_ring_push_retry(struct lab_ring *r, const struct lab_job *j,
 uint32_t lab_ring_count(const struct lab_ring *r);
 void lab_ring_wake_all(struct lab_ring *r);
 
-int lab_pool_init(struct lab_pool *p, uint32_t cap);
-void lab_pool_destroy(struct lab_pool *p);
-uint32_t lab_pool_push(struct lab_pool *p, const uint64_t *addrs, uint32_t n);
-uint32_t lab_pool_pop(struct lab_pool *p, uint64_t *addrs, uint32_t n);
+int lab_addr_ring_init(struct lab_addr_ring *r, uint32_t cap);
+void lab_addr_ring_destroy(struct lab_addr_ring *r);
+uint32_t lab_addr_ring_push(struct lab_addr_ring *r, const uint64_t *addrs,
+			    uint32_t n);
+uint32_t lab_addr_ring_pop(struct lab_addr_ring *r, uint64_t *addrs,
+			   uint32_t n);
 
 int lab_pair_open(struct lab_pair *p, const char *loc_if, const char *wan_if,
 		  const char *bpf_loc_o, const char *bpf_wan_o);
